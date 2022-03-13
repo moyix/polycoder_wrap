@@ -1,3 +1,4 @@
+import sys
 import os
 import json
 import subprocess
@@ -5,17 +6,16 @@ from transformers import GPT2TokenizerFast
 from string import Template
 import fcntl
 
-os.environ['DOCKER_HOST'] = 'unix:///var/run/docker-nvme.sock'
 # Shut up the warning
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
-
-NUM_GPUS = 2
 
 FASTDATA = '/fastdata'
 BASEDIR = os.path.join(FASTDATA, 'CodeLMs')
 INDIR  = os.path.join(BASEDIR, 'conf')
 OUTDIR = os.path.join(BASEDIR, 'out')
-DOCKER_IMG = 'polycoder:local'
+os.makedirs(INDIR, exist_ok=True)
+os.makedirs(OUTDIR, exist_ok=True)
+DOCKER_IMG = 'moyix/polycoder:base'
 VOCAB_FILE = os.path.join(BASEDIR, 'data/code-vocab.json')
 MERGE_FILE = os.path.join(BASEDIR, 'data/code-merges.txt')
 
@@ -23,10 +23,20 @@ tok = GPT2TokenizerFast(VOCAB_FILE, MERGE_FILE)
 
 MAX_TOKENS = 2048
 
+def detect_gpus():
+    """
+    Returns the number of GPUs available on the system.
+    """
+    try:
+        nvidia_smi = subprocess.check_output(['nvidia-smi', '--query-gpu=gpu_name', '--format=csv,noheader'])
+        return len(nvidia_smi.splitlines())
+    except subprocess.CalledProcessError:
+        return -1
+
 def trim_prompt(prompt, n):
     """
     Trim a prompt to fit within the PolyCoder prompt length limit.
-    Trims one line at a time.
+    Trims whole lines at a time.
     prompt: a string
     n: the number of tokens we want to generate
 
@@ -54,13 +64,12 @@ DOCKER_CMD = [
     'nvidia-docker', 'run',
     '--privileged',
     '--rm', '-it',
-    # '-e', 'CUDA_VISIBLE_DEVICES=${gpu_num}',
     '--shm-size=1g',
     '--ulimit', 'memlock=-1',
     '--mount', f'type=bind,src={BASEDIR}/checkpoints-2-7B,dst=/gpt-neox/checkpoints',
     # NB: want host and container paths to be the same to avoid
     # having to translate between them
-    '-v', f'/fastdata:/fastdata',
+    '-v', f'{FASTDATA}:{FASTDATA}',
     DOCKER_IMG,
 ]
 
@@ -181,13 +190,29 @@ def create_batch(batch):
 if __name__ == "__main__":
     import argparse
     import time
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('-m', '--max_tokens', type=int, default=512, help='Max number of tokens to generate')
-    parser.add_argument('-n', '--num_samples', type=int, default=10, help='Number of samples to generate')
+    parser.add_argument('-n', '--num_samples', type=int, default=10, help='Number of samples to generate per prompt')
     parser.add_argument('-p', '--top_p', type=float, default=0.0, help='Top p')
     parser.add_argument('-t', '--temperature', type=float, default=0.5, help='Temperature')
+    parser.add_argument('--num_gpus', type=int, default=argparse.SUPPRESS, help='Number of GPUs to use (default: autodetect)')
     parser.add_argument('prompt_files', nargs='+', help='Prompt files')
     args = parser.parse_args()
+
+    # A few checks to make sure the model is downloaded
+    if not os.path.exists(f"{BASEDIR}/checkpoints-2-7B"):
+        print("Hmm, I didn't find the model at {BASEDIR}/checkpoints-2-7B.", file=sys.stderr)
+        print("", file=sys.stderr)
+        sys.exit(1)
+
+    if 'num_gpus' not in args:
+        NUM_GPUS = detect_gpus()
+        if NUM_GPUS == -1:
+            print("WARNING: Couldn't detect the number of GPUs using nvidia-smi.", file=sys.stderr)
+            print("Assuming NUM_GPUS = 1, but you can fix this with --num_gpus", file=sys.stderr)
+            NUM_GPUS = 1
+    else:
+        NUM_GPUS = args.num_gpus
 
     prompts = []
     for f in args.prompt_files: 
@@ -204,7 +229,9 @@ if __name__ == "__main__":
     result_files = create_batch(prompts)
     end = time.time()
     taken = end - start
-    print("\n".join(result_files))
+    print("All done, results are in:")
+    for pf, res in zip(args.prompt_files, result_files):
+        print(f"  {pf} -> {res}")
     samples_generated = args.num_samples * len(prompts)
     tokens_generated = samples_generated * args.max_tokens
     print(f"Took {taken:.2f} seconds to generate {samples_generated} samples, {tokens_generated} tokens")
