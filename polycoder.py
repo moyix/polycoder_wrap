@@ -6,6 +6,8 @@ from string import Template
 import fcntl
 
 os.environ['DOCKER_HOST'] = 'unix:///var/run/docker-nvme.sock'
+# Shut up the warning
+os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
 NUM_GPUS = 2
 
