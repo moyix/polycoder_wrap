@@ -159,6 +159,10 @@ def create(prompt, max_tokens, temperature, top_p, n):
             results.append(json.loads(line))
     return results
 
+# This is kind of dumb and inefficient; launching a new container for
+# each generation means that we have to reload the model every time.
+# Better would be to put all the prompts in a single config, but that
+# would require a bunch of changes to NeoX's textgen code.
 def create_batch(batch):
     output_files = []
     for i in range(0, len(batch), NUM_GPUS):
@@ -166,25 +170,40 @@ def create_batch(batch):
         for j, (prompt, max_tokens, temperature, top_p, n) in enumerate(batch[i:i+NUM_GPUS]):
             cmd, output_file = prepare_cmd(prompt, max_tokens, temperature, top_p, n, gpu_num=j)
             output_files.append(output_file)
-            # procs.append(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-            procs.append(subprocess.Popen(cmd))
+            print(f"Launching container for generation on GPU {j}")
+            procs.append(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         for proc in procs:
             proc.wait()
     return output_files
 
 if __name__ == "__main__":
-    two_commands = [
-        (TEST_PROMPT,   256, 0.5, 0.0, 10),
-        (TEST_PROMPT_2, 256, 0.5, 0.0, 10),
-    ]
     import argparse
+    import time
     parser = argparse.ArgumentParser()
     parser.add_argument('-m', '--max_tokens', type=int, default=512, help='Max number of tokens to generate')
     parser.add_argument('-n', '--num_samples', type=int, default=10, help='Number of samples to generate')
     parser.add_argument('-p', '--top_p', type=float, default=0.0, help='Top p')
     parser.add_argument('-t', '--temperature', type=float, default=0.5, help='Temperature')
     parser.add_argument('prompt_files', nargs='+', help='Prompt files')
+    args = parser.parse_args()
 
+    prompts = []
+    for f in args.prompt_files: 
+        with open(f, 'r') as fp:
+            prompt = fp.read()
+            trimmed_prompt = trim_prompt(prompt, args.max_tokens)
+            if prompt != trimmed_prompt:
+                print(f"Note: prompt trimmed from {len(prompt.splitlines())} to {len(trimmed_prompt.splitlines())} lines")
+                print(f"Saving trimmed prompt to {f}.trimmed")
+                open(f + '.trimmed', 'w').write(trimmed_prompt)
+            prompts.append((trimmed_prompt, args.max_tokens, args.temperature, args.top_p, args.num_samples))
     # j = create(TEST_PROMPT, max_tokens=100, temperature=0.5, top_p=0.0, n=10)
-    result_files = create_batch(two_commands)
+    start = time.time()
+    result_files = create_batch(prompts)
+    end = time.time()
+    taken = end - start
     print("\n".join(result_files))
+    samples_generated = args.num_samples * len(prompts)
+    tokens_generated = samples_generated * args.max_tokens
+    print(f"Took {taken:.2f} seconds to generate {samples_generated} samples, {tokens_generated} tokens")
+    print(f"Generated {samples_generated/taken:.2f} samples/second, {tokens_generated/taken:.2f} tokens/second")
