@@ -62,8 +62,7 @@ def trim_prompt(prompt, n):
 # How to invoke Docker
 DOCKER_CMD = [
     'nvidia-docker', 'run',
-    '--privileged',
-    '--rm', '-it',
+    '--privileged', '--rm',
     '--shm-size=1g',
     '--ulimit', 'memlock=-1',
     '--mount', f'type=bind,src={BASEDIR}/checkpoints-2-7B,dst=/gpt-neox/checkpoints',
