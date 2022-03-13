@@ -155,7 +155,7 @@ def prepare_cmd(prompt, max_tokens, temperature, top_p, n, gpu_num=0):
     # Run the container
     cmd = template_cmd(DOCKER_CMD + CONTAINER_CMD,
         config=config_file, gpu_num=gpu_num)
-    print(cmd)
+    print('Cmd:', ' '.join(cmd))
     return cmd, output_file
 
 def create(prompt, max_tokens, temperature, top_p, n):
