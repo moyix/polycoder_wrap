@@ -1,4 +1,5 @@
 import sys
+import math
 import os
 import json
 import subprocess
@@ -154,7 +155,7 @@ def prepare_cmd(prompt, max_tokens, temperature, top_p, n, gpu_num=0):
 
     # Run the container
     cmd = template_cmd(DOCKER_CMD + CONTAINER_CMD,
-        config=config_file, gpu_num=gpu_num)
+        config=config_file)
     print('Cmd:', ' '.join(cmd))
     return cmd, output_file
 
@@ -169,21 +170,76 @@ def create(prompt, max_tokens, temperature, top_p, n):
             results.append(json.loads(line))
     return results
 
-# This is kind of dumb and inefficient; launching a new container for
-# each generation means that we have to reload the model every time.
-# Better would be to put all the prompts in a single config, but that
-# would require a bunch of changes to NeoX's textgen code.
-def create_batch(batch):
+def prepare_batch(args, gpu_num=0):
+    """
+    Prepares the codegen command to be run in a Docker container.
+
+    Returns (cmd, outfile)
+    """
+    # Save the prompt to a file
+    glob_counter = get_counter()
+
     output_files = []
-    for i in range(0, len(batch), NUM_GPUS):
-        procs = []
-        for j, (prompt, max_tokens, temperature, top_p, n) in enumerate(batch[i:i+NUM_GPUS]):
-            cmd, output_file = prepare_cmd(prompt, max_tokens, temperature, top_p, n, gpu_num=j)
-            output_files.append(output_file)
-            print(f"Launching container for generation on GPU {j}")
-            procs.append(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        for proc in procs:
-            proc.wait()
+    objs = []
+    for prompt, max_tokens, temperature, top_p, top_k, n in args:
+        counter = get_counter()
+        filename_pattern = f'PolyCoder_t{temperature:.2f}_p{top_p:.2f}_n{n}_max{max_tokens}.{counter:03d}'
+        output_file = os.path.join(OUTDIR, f'Gen_{filename_pattern}.jsonl')
+        obj = {}
+        obj['prompt'] = prompt
+        obj['max_tokens'] = max_tokens
+        obj['temperature'] = temperature
+        obj['top_p'] = top_p
+        obj['top_k'] = top_k
+        obj['num_samples'] = n
+        obj['output_file'] = output_file
+        obj['recompute'] = False
+        objs.append(obj)
+        output_files.append(output_file)
+    out_json = os.path.join(INDIR, f'Batch_{glob_counter:03d}.json')
+    with open(out_json, 'w') as f:
+        json.dump(objs, f)
+     
+    TEXTGEN_CONFIG = {
+        # Text gen type: `input-file`, `unconditional` or `interactive`
+        "text-gen-type": "batch",
+        "batch-input-file": out_json,
+        
+        "recompute": False,
+        
+        # DeepSpeed doesn't respect CUDA_VISIBLE_DEVICES, so we need to set this
+        "include": f"localhost:{gpu_num}",
+
+        # Magic: even though we're doing inference, DeepSpeed still checks
+        # that train_batch_size == micro_batch_per_gpu * gradient_acc_step * world_size64
+        "train_batch_size": 32,
+    }
+
+    # Save the config to a file. Extension is YML but it's really JSON
+    config_file = os.path.join(INDIR,
+        f'Config_{glob_counter:03d}.yml')
+    with open(config_file, 'w') as f:
+        json.dump(TEXTGEN_CONFIG, f)
+
+    # Run the container
+    cmd = template_cmd(DOCKER_CMD + CONTAINER_CMD,
+        config=config_file, gpu_num=gpu_num)
+    print('Cmd:', ' '.join(cmd))
+    return cmd, output_files
+
+def create_batch(batch):
+    part_size = math.ceil(len(batch) / NUM_GPUS)
+    output_files = []
+    procs = []
+    for i in range(0, len(batch), part_size):
+        argpart = batch[i:i+part_size]
+        gpunum = i // part_size
+        cmd, output_files_part = prepare_batch(argpart, gpu_num=gpunum)
+        print(f"Launching container for batch generation of {part_size} tasks on GPU {gpunum}")
+        procs.append(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        output_files += output_files_part
+    for proc in procs:
+        proc.wait()
     return output_files
 
 if __name__ == "__main__":
@@ -193,6 +249,7 @@ if __name__ == "__main__":
     parser.add_argument('-m', '--max_tokens', type=int, default=512, help='Max number of tokens to generate')
     parser.add_argument('-n', '--num_samples', type=int, default=10, help='Number of samples to generate per prompt')
     parser.add_argument('-p', '--top_p', type=float, default=0.0, help='Top p')
+    parser.add_argument('-k', '--top_k', type=float, default=0.0, help='Top k')
     parser.add_argument('-t', '--temperature', type=float, default=0.5, help='Temperature')
     parser.add_argument('--num_gpus', type=int, default=argparse.SUPPRESS, help='Number of GPUs to use (default: autodetect)')
     parser.add_argument('prompt_files', nargs='+', help='Prompt files')
@@ -222,7 +279,7 @@ if __name__ == "__main__":
                 print(f"Note: prompt trimmed from {len(prompt.splitlines())} to {len(trimmed_prompt.splitlines())} lines")
                 print(f"Saving trimmed prompt to {f}.trimmed")
                 open(f + '.trimmed', 'w').write(trimmed_prompt)
-            prompts.append((trimmed_prompt, args.max_tokens, args.temperature, args.top_p, args.num_samples))
+            prompts.append((trimmed_prompt, args.max_tokens, args.temperature, args.top_p, args.top_k, args.num_samples))
     # j = create(TEST_PROMPT, max_tokens=100, temperature=0.5, top_p=0.0, n=10)
     start = time.time()
     result_files = create_batch(prompts)
